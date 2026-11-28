@@ -47,7 +47,7 @@ from docling_jobkit.datamodel.convert import (
 )
 from docling_jobkit.datamodel.result import ChunkedDocumentResult, ExportResult
 from docling_jobkit.datamodel.task import Task, TaskSource
-from docling_jobkit.datamodel.task_meta import TaskType
+from docling_jobkit.datamodel.task_meta import TaskStatus, TaskType
 from docling_jobkit.orchestrators.local.orchestrator import (
     LocalOrchestrator,
     LocalOrchestratorConfig,
@@ -455,6 +455,43 @@ async def test_chunk_file(
 
     if isinstance(chunking_options, HierarchicalChunkerOptions):
         assert task_result.result.chunks[0].num_tokens is None
+
+
+async def test_chunk_task_fails_when_tokenizer_cannot_load(
+    orchestrator: LocalOrchestrator,
+):
+    """An expired HF token (401 on tokenizer load) must fail the task."""
+    from unittest.mock import patch
+
+    from docling.datamodel.service.responses import FailureCategory, FailurePhase
+
+    doc_filename = Path(__file__).parent / "2206.01062v1-pg4.pdf"
+    encoded_doc = base64.b64encode(doc_filename.read_bytes()).decode()
+    sources: list[TaskSource] = [
+        FileSource(base64_string=encoded_doc, filename=doc_filename.name)
+    ]
+
+    with patch(
+        "docling_jobkit.convert.chunking.HuggingFaceTokenizer.from_pretrained",
+        side_effect=OSError("401 Client Error: Unauthorized for url"),
+    ):
+        task = await orchestrator.enqueue(
+            task_type=TaskType.CHUNK,
+            sources=sources,
+            convert_options=ConvertDocumentsOptions(to_formats=[]),
+            chunking_options=HybridChunkerOptions(),
+            target=InBodyTarget(),
+        )
+        assert await _wait_task_complete(orchestrator, task.task_id)
+
+    task = await orchestrator.task_status(task_id=task.task_id)
+    assert task.task_status == TaskStatus.FAILURE
+    assert task.error_message == "Document chunking failed (RuntimeError)."
+    assert task.failure is not None
+    assert task.failure.category == FailureCategory.BACKEND_FAILURE
+    assert task.failure.phase == FailurePhase.EXECUTION
+    assert task.failure.message == "Document chunking failed (RuntimeError)."
+    assert await orchestrator.task_result(task_id=task.task_id) is None
 
 
 @pytest.mark.asyncio
