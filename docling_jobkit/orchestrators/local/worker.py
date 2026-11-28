@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from docling.datamodel.service.responses import FailurePhase
 from docling.datamodel.service.tasks import TaskType
 
 from docling_jobkit.convert.chunking import (
@@ -20,7 +21,10 @@ from docling_jobkit.datamodel.exportable_document import (
 from docling_jobkit.datamodel.result import DoclingTaskResult
 from docling_jobkit.datamodel.task_meta import TaskStatus
 from docling_jobkit.orchestrators.callback_invoker import CallbackInvoker
-from docling_jobkit.public_errors import build_public_task_error
+from docling_jobkit.public_errors import (
+    build_public_task_error,
+    classify_public_task_failure,
+)
 
 if TYPE_CHECKING:
     from docling_jobkit.orchestrators.local.orchestrator import LocalOrchestrator
@@ -145,6 +149,9 @@ class AsyncLocalWorker:
                 )
                 task.set_status(TaskStatus.FAILURE)
                 task.error_message = build_public_task_error(e)
+                task.failure = classify_public_task_failure(
+                    e, task_id=task_id, phase=FailurePhase.EXECUTION
+                )
 
             finally:
                 if workdir.exists():

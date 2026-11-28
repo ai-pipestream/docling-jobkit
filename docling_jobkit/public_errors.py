@@ -42,6 +42,23 @@ class PipelineInitializationError(Exception):
     """
 
 
+class ChunkingError(RuntimeError):
+    """Chunking produced no usable result because the chunker raised.
+
+    Raised by ``process_chunkable_results`` when no document in the task could
+    be chunked (for example the tokenizer could not be loaded, which is a
+    request-wide failure). The message is already sanitized for clients: it
+    names the exception types only, never their text. Full detail is logged.
+    Lifecycle owners classify by this type instead of matching error text.
+    """
+
+
+def chunking_error_message(root_error_types: Sequence[str]) -> str:
+    """Return the client-facing message for chunker exceptions of given types."""
+    unique = sorted(set(root_error_types))
+    return f"Document chunking failed ({', '.join(unique)})."
+
+
 INTERNAL_TASK_ERROR_MESSAGE = "Internal processing error."
 _ALLOWED_DETAIL_KEYS = {
     "source_kind",
@@ -76,7 +93,12 @@ def _unwrap_failure_exception(exc: BaseException) -> BaseException:
 
         if isinstance(
             current,
-            (ConnectorAuthenticationError, SourceConnectorError, TargetWriteError),
+            (
+                ConnectorAuthenticationError,
+                SourceConnectorError,
+                TargetWriteError,
+                ChunkingError,
+            ),
         ):
             return current
 
@@ -132,6 +154,12 @@ def classify_public_task_failure(
             **_safe_details(timeout_class=root_exc.__class__.__name__),
         }
         message = "Task exceeded the allowed execution time."
+    elif isinstance(root_exc, ChunkingError):
+        # The chunker (or its tokenizer) raised for every document in the task.
+        category = FailureCategory.BACKEND_FAILURE
+        phase = FailurePhase.EXECUTION
+        retryable = False
+        message = exception_text
     elif isinstance(root_exc, MaterializationLimitExceededError):
         # Local preflight rejected a document that exceeds configured service limits.
         category = FailureCategory.POLICY
@@ -196,6 +224,7 @@ def build_public_task_error(exc: BaseException) -> str:
         or isinstance(root_exc, SourceLimitExceededError)
         or isinstance(root_exc, ConnectorAuthenticationError)
         or isinstance(root_exc, SourceConnectorError)
+        or isinstance(root_exc, ChunkingError)
     ):
         return _exception_text(root_exc)
     return INTERNAL_TASK_ERROR_MESSAGE

@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 import httpx
 from pydantic import BaseModel, Field
 
-from docling.datamodel.base_models import ConversionStatus
+from docling.datamodel.base_models import (
+    ConversionStatus,
+    DoclingComponentType,
+    ErrorItem,
+)
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.service.callbacks import (
     ProcessedDocsItem,
@@ -27,6 +31,7 @@ from docling.datamodel.service.chunking import (
     HybridChunkerOptions,
 )
 from docling.datamodel.service.options import ConvertDocumentsOptions
+from docling.datamodel.service.responses import FailureCategory
 from docling.datamodel.service.targets import InBodyTarget, PutTarget
 from docling_core.transforms.chunker import BaseChunker
 from docling_core.transforms.chunker.hierarchical_chunker import (
@@ -65,7 +70,12 @@ from docling_jobkit.datamodel.target_field_slots import (
     coerce_large_ints,
 )
 from docling_jobkit.datamodel.task import Task
-from docling_jobkit.public_errors import TargetWriteError, render_public_error_list
+from docling_jobkit.public_errors import (
+    ChunkingError,
+    TargetWriteError,
+    chunking_error_message,
+    render_public_error_list,
+)
 
 if TYPE_CHECKING:
     from docling_jobkit.orchestrators.callback_invoker import CallbackInvoker
@@ -386,6 +396,7 @@ def process_chunkable_results(
     num_succeeded = 0
     num_failed = 0
     docs: list[ProcessedDocsItem] = []
+    chunk_failure_types: list[str] = []
 
     # TODO: DocumentChunkerManager should be initialized outside for really working as a cache
     chunker_manager = chunker_manager or DocumentChunkerManager()
@@ -405,6 +416,7 @@ def process_chunkable_results(
             exportable_document.errors,
         )
         errors = exportable_document.errors
+        doc_status = exportable_document.status
         filename = exportable_document.file.name
         if (
             exportable_document.status == ConversionStatus.SUCCESS
@@ -427,15 +439,19 @@ def process_chunkable_results(
                     stack_info=True,
                 )
                 num_failed += 1
-                # TODO: for propagating errors we have first to allow other component_type in the Docling class.
-                # errors = [
-                #     *errors,
-                #     ErrorItem(
-                #         component_type="chunking",
-                #         module_name=type(e).__name__,
-                #         error_message=str(e),
-                #     ),
-                # ]
+                chunk_failure_types.append(type(e).__name__)
+                # Record the failure on the document as a typed error so the
+                # document is not reported as converted and chunked.
+                doc_status = ConversionStatus.FAILURE
+                errors = [
+                    *errors,
+                    ErrorItem(
+                        component_type=DoclingComponentType.PIPELINE,
+                        module_name=type(e).__name__,
+                        error_message=chunking_error_message([type(e).__name__]),
+                        category=FailureCategory.BACKEND_FAILURE,
+                    ),
+                ]
 
         else:
             _log.warning(f"Document {exportable_document.file} failed to convert.")
@@ -448,12 +464,10 @@ def process_chunkable_results(
         docs.append(
             ProcessedDocsItem(
                 source=str(exportable_document.file),
-                status=exportable_document.status,
+                status=doc_status,
                 error=summary_error
                 or (
-                    "Unknown error"
-                    if exportable_document.status != ConversionStatus.SUCCESS
-                    else None
+                    "Unknown error" if doc_status != ConversionStatus.SUCCESS else None
                 ),
             )
         )
@@ -510,7 +524,7 @@ def process_chunkable_results(
 
         doc_result = DocumentResultItem(
             document=doc_content,
-            status=exportable_document.status,
+            status=doc_status,
             timings=exportable_document.timings,
             errors=errors,
         )
@@ -536,6 +550,12 @@ def process_chunkable_results(
                 docs=docs,
             ),
         )
+
+    # A chunker that raised for every document that converted is a failed task,
+    # not an empty successful result. Partial failures stay visible per document
+    # (status FAILURE with a typed error) and in num_failed.
+    if chunk_failure_types and num_succeeded == 0:
+        raise ChunkingError(chunking_error_message(chunk_failure_types))
 
     # Export results based on target type and options
     if isinstance(first_target, InBodyTarget):
